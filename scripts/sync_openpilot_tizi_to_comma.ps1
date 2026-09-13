@@ -20,6 +20,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$forkManagerScripts = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "scripts"
+$blobHooks = Join-Path $forkManagerScripts "device_blob_hooks.ps1"
+if (Test-Path -LiteralPath $blobHooks) {
+  . $blobHooks
+}
+
 function Get-InstallerInfo {
   param(
     [Parameter(Mandatory = $true)]
@@ -181,6 +187,9 @@ $tmpPath = "/data/tmppilot"
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
 try {
+  if (Get-Command Invoke-ForkManagerHostBlobFetch -ErrorAction SilentlyContinue) {
+    Invoke-ForkManagerHostBlobFetch -RepoPath (Get-Location).Path
+  }
   Write-Step "Creating local git bundle"
   Invoke-Git -Arguments @("bundle", "create", $bundlePath, $bundleSourceBranch)
 
@@ -218,6 +227,11 @@ if [ -d __DEVICE_PATH__ ]; then
 fi
 mv __TMP_PATH__ __DEVICE_PATH__
 
+# Fork Manager: drop .gitignore and fetch proprietary runtime blobs.
+if [ -f /data/fetch_device_blobs.sh ]; then
+  DEVICE_PATH=__DEVICE_PATH__ sh /data/fetch_device_blobs.sh
+fi
+
 cat >__CONTINUE_PATH__ <<'EOF'
 #!/usr/bin/env bash
 
@@ -247,6 +261,9 @@ sync
   [System.IO.File]::WriteAllText($localInstallScriptPath, $deviceInstallScript, [System.Text.UTF8Encoding]::new($false))
 
   Write-Step "Pushing bundle and install script over adb"
+  if (Get-Command Get-ForkManagerDeviceBlobFetchScript -ErrorAction SilentlyContinue) {
+    Invoke-Adb -Arguments @("push", (Get-ForkManagerDeviceBlobFetchScript), "/data/fetch_device_blobs.sh")
+  }
   Invoke-Adb -Arguments @("push", $bundlePath, $DeviceBundlePath)
   Invoke-Adb -Arguments @("push", $localInstallScriptPath, $DeviceScriptPath)
 

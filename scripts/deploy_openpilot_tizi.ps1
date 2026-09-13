@@ -393,7 +393,12 @@ if (-not $AdbPath -or -not (Test-Path -LiteralPath $AdbPath)) {
   throw "ADB not found. Pass -AdbPath, run Fork_Manager.bat setup adb, or put adb.exe on PATH."
 }
 
-$adbSessionHelper = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "scripts\adb_session.ps1"
+$forkManagerScripts = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "scripts"
+$adbSessionHelper = Join-Path $forkManagerScripts "adb_session.ps1"
+$blobHooks = Join-Path $forkManagerScripts "device_blob_hooks.ps1"
+if (Test-Path -LiteralPath $blobHooks) {
+  . $blobHooks
+}
 if (Test-Path -LiteralPath $adbSessionHelper) {
   . $adbSessionHelper
 } else {
@@ -499,6 +504,10 @@ if ($SkipDeviceInstall) {
   exit 0
 }
 
+if (Get-Command Invoke-ForkManagerHostBlobFetch -ErrorAction SilentlyContinue) {
+  Invoke-ForkManagerHostBlobFetch -RepoPath (Get-Location).Path
+}
+
 Write-Step "Checking adb connection"
 if (Get-Command Ensure-AdbSession -ErrorAction SilentlyContinue) {
   $null = Ensure-AdbSession -AdbPath $AdbPath -ProbeShell
@@ -560,6 +569,11 @@ if [ -d __DEVICE_PATH__ ]; then
 fi
 mv __TMP_PATH__ __DEVICE_PATH__
 
+# Fork Manager: drop .gitignore and fetch proprietary runtime blobs.
+if [ -f /data/fetch_device_blobs.sh ]; then
+  DEVICE_PATH=__DEVICE_PATH__ sh /data/fetch_device_blobs.sh
+fi
+
 # Align AGNOS startup gate with the OS already on this comma.
 if [ -r /VERSION ]; then
   device_agnos="$(tr -d '\n\r' < /VERSION)"
@@ -619,6 +633,9 @@ Write-Step "Installing $InstallerBranch to the connected device"
 try {
   $deviceInstallScript = $deviceInstallScript.Replace("`r`n", "`n")
   [System.IO.File]::WriteAllText($localInstallScriptPath, $deviceInstallScript, [System.Text.UTF8Encoding]::new($false))
+  if (Get-Command Get-ForkManagerDeviceBlobFetchScript -ErrorAction SilentlyContinue) {
+    Invoke-Adb -Arguments @("push", (Get-ForkManagerDeviceBlobFetchScript), "/data/fetch_device_blobs.sh") -TimeoutSeconds $AdbPushTimeoutSeconds
+  }
   Invoke-Adb -Arguments @("push", $localInstallScriptPath, $DeviceScriptPath) -TimeoutSeconds $AdbPushTimeoutSeconds
   Invoke-Adb -Arguments @("shell", "sh", $DeviceScriptPath) -TimeoutSeconds $AdbInstallTimeoutSeconds
 } finally {
