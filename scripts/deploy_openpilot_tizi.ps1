@@ -313,28 +313,15 @@ sudo -u comma bash -lc 'cd __DEVICE_PATH__ && nohup ./launch_openpilot.sh >/tmp/
 }
 
 function Wait-ForSoftwareReady {
-  param([int]$TimeoutSeconds = 120)
+  param([int]$TimeoutSeconds = 180, [int]$HoldSeconds = 60)
 
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 5
-
-    try {
-      $procSummary = Get-AdbOutput -Arguments @("shell", "sh", "-c", "pgrep -af 'manager.py|build.py|spinner.py|text.py|selfdrive.ui.ui|selfdrive.pandad.pandad|./pandad' || true") -TimeoutSeconds $AdbProbeTimeoutSeconds
-    } catch {
-      continue
-    }
-
-    if ($procSummary -match 'manager\.py|build\.py|spinner\.py|selfdrive\.ui\.ui|selfdrive\.pandad\.pandad|\.\/pandad') {
-      return $true
-    }
-
-    if ($procSummary -match 'text\.py') {
-      return $false
-    }
-  }
-
-  return $false
+  return Wait-ForkManagerSustainedHealth -GetProcessList {
+    Get-AdbOutput -Arguments @("shell", "sh", "-c", "pgrep -af 'manager.py|selfdrive.ui.ui|selfdrive.pandad.pandad|./pandad' || true") -TimeoutSeconds $AdbProbeTimeoutSeconds
+  } -Patterns @{
+    manager = "manager\.py"
+    ui = "selfdrive\.ui\.ui"
+    pandad = "pandad"
+  } -ErrorPattern "text\.py" -StartupTimeoutSeconds $TimeoutSeconds -HoldSeconds $HoldSeconds
 }
 
 function Get-DevicePandaCounts {
@@ -396,9 +383,11 @@ if (-not $AdbPath -or -not (Test-Path -LiteralPath $AdbPath)) {
 $forkManagerScripts = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "scripts"
 $adbSessionHelper = Join-Path $forkManagerScripts "adb_session.ps1"
 $blobHooks = Join-Path $forkManagerScripts "device_blob_hooks.ps1"
-if (Test-Path -LiteralPath $blobHooks) {
-  . $blobHooks
+if (-not (Test-Path -LiteralPath $blobHooks)) {
+  throw "Required Fork Manager helper is missing: $blobHooks"
 }
+. $blobHooks
+Assert-ForkManagerHelpersPresent
 if (Test-Path -LiteralPath $adbSessionHelper) {
   . $adbSessionHelper
 } else {
@@ -521,156 +510,61 @@ if ($onlineDevices.Count -eq 0) {
   throw "No adb device detected"
 }
 
-$tmpPath = "/data/tmppilot"
-$deviceInstallScript = @'
-set -e
+$payloadDir = Join-Path ([System.IO.Path]::GetTempPath()) ("openpilot-payload-" + [guid]::NewGuid().ToString("N"))
+$DevicePayload = "/data/fork-manager-payload"
+$stagingPath = "/data/fork-manager-staging"
+Invoke-ForkManagerPreparePayload -ForkKey "openpilot" -RepoPath (Get-Location).Path -Ref $headCommit -OutputDir $payloadDir
 
-pkill -9 -f 'launch_chffrplus.sh|system/manager/manager.py|./manager.py|system.updated.updated|selfdrive.pandad.pandad|./pandad|selfdrive.ui.ui|system/ui/text.py|starpilot\.' || true
-
-if grep -q ' /data/safe_staging/merged ' /proc/mounts 2>/dev/null; then
-  umount -l /data/safe_staging/merged || true
-fi
-
-rm -rf /data/safe_staging
-rm -f /tmp/safe_staging_overlay.lock
-
-# Reset StarPilot-specific persistent data so stock-ish installs do not inherit
-# custom themes, test data, or stale toggle markers.
-rm -rf /data/themes /data/stats_sp /data/testing_grounds
-rm -f /data/starpilot_defaults_parity_v1 /data/starpilot_humanlike_disable_v1 /data/starpilot_param_canonicalization_v1 /data/starpilot_param_rename_v1 /data/starpilot_pc_root_v1
-rm -f /data/params/d/BootLogo /data/params/d/ColorScheme /data/params/d/CustomThemes /data/params/d/DistanceIconPack /data/params/d/HolidayThemes /data/params/d/IconPack /data/params/d/RandomThemes /data/params/d/SignalAnimation /data/params/d/SoundPack /data/params/d/WheelIcon
-
-# If the old install is StarPilot, restore its stock boot background in the
-# landscape orientation expected by AGNOS startup. StarPilot keeps this asset in
-# portrait form, which makes the second loading-screen comma logo appear rotated
-# after switching to non-StarPilot forks.
-stock_boot_bg=/tmp/fork-switch-stock-bg-landscape.jpg
-rm -f "$stock_boot_bg"
-if [ -f __DEVICE_PATH__/starpilot/assets/other_images/stock_bg.jpg ] && [ -x /usr/local/venv/bin/python ]; then
-  /usr/local/venv/bin/python - "__DEVICE_PATH__/starpilot/assets/other_images/stock_bg.jpg" "$stock_boot_bg" <<'PY' || rm -f "$stock_boot_bg"
-import sys
-from PIL import Image, ImageOps
-
-source_path, target_path = sys.argv[1:3]
-with Image.open(source_path) as image:
-  image = ImageOps.exif_transpose(image).convert("RGB")
-  if image.height > image.width:
-    image = image.rotate(-90, expand=True)
-  image.save(target_path, "JPEG", quality=95)
-PY
-fi
-
-rm -rf __TMP_PATH__
-git clone --progress __INSTALLER_REPO__ -b __INSTALLER_BRANCH__ --depth=1 --recurse-submodules __TMP_PATH__
-
-rm -rf __BACKUP_PATH__
-if [ -d __DEVICE_PATH__ ]; then
-  mv __DEVICE_PATH__ __BACKUP_PATH__
-fi
-mv __TMP_PATH__ __DEVICE_PATH__
-
-# Fork Manager: drop .gitignore and fetch proprietary runtime blobs.
-if [ -f /data/fetch_device_blobs.sh ]; then
-  DEVICE_PATH=__DEVICE_PATH__ sh /data/fetch_device_blobs.sh
-fi
-
-# Align AGNOS startup gate with the OS already on this comma.
-if [ -r /VERSION ]; then
-  device_agnos="$(tr -d '\n\r' < /VERSION)"
-  for launch_env in __DEVICE_PATH__/launch_env.sh __DEVICE_PATH__/sunnypilot/system/hardware/c3/launch_env.sh; do
-    [ -f "$launch_env" ] || continue
-    if grep -q 'export AGNOS_VERSION=' "$launch_env"; then
-      sed -i "s/export AGNOS_VERSION=\"[^\"]*\"/export AGNOS_VERSION=\"${device_agnos}\"/" "$launch_env"
-    fi
-  done
-fi
-
-if [ -f "$stock_boot_bg" ]; then
-  root_mount_options="$(findmnt -n -o OPTIONS / 2>/dev/null || true)"
-  if mount -o remount,rw / 2>/dev/null || sudo mount -o remount,rw / 2>/dev/null; then
-    cp "$stock_boot_bg" /usr/comma/bg.jpg
-    chmod 664 /usr/comma/bg.jpg 2>/dev/null || true
-    chown root:root /usr/comma/bg.jpg 2>/dev/null || true
-    rm -f /tmp/bg.jpg 2>/dev/null || true
-    if [ -n "$root_mount_options" ]; then
-      mount -o "remount,$root_mount_options" / 2>/dev/null || sudo mount -o "remount,$root_mount_options" / 2>/dev/null || true
-    else
-      mount -o remount,ro / 2>/dev/null || sudo mount -o remount,ro / 2>/dev/null || true
-    fi
-  fi
-  rm -f "$stock_boot_bg"
-fi
-
-mkdir -p /data/params/d
-printf '%s' '__INSTALLER_BRANCH__' > /data/params/d/UpdaterTargetBranch
-printf '%s' 'idle' > /data/params/d/UpdaterState
-rm -f /data/params/d/JoystickDebugMode /data/params/d/UpdateAvailable /data/params/d/Updated /data/params/d/UpdaterAvailableBranches /data/params/d/UpdaterCurrentDescription /data/params/d/UpdaterCurrentReleaseNotes /data/params/d/UpdaterFetchAvailable /data/params/d/UpdaterNewDescription /data/params/d/UpdaterNewReleaseNotes /data/params/d/LastUpdateException
-chown comma:comma /data/params/d/UpdaterTargetBranch /data/params/d/UpdaterState 2>/dev/null || true
-
-cat >__CONTINUE_PATH__ <<'EOF'
-#!/usr/bin/env bash
-
-cd __DEVICE_PATH__
-exec ./launch_openpilot.sh
-EOF
-
-chmod +x __CONTINUE_PATH__
-chown comma:comma __CONTINUE_PATH__
-chown -R comma:comma __DEVICE_PATH__
-sync
-'@
-
-$deviceInstallScript = $deviceInstallScript.Replace("__TMP_PATH__", $tmpPath)
-$deviceInstallScript = $deviceInstallScript.Replace("__INSTALLER_REPO__", $InstallerRepo)
-$deviceInstallScript = $deviceInstallScript.Replace("__INSTALLER_BRANCH__", $InstallerBranch)
-$deviceInstallScript = $deviceInstallScript.Replace("__BACKUP_PATH__", $BackupPath)
-$deviceInstallScript = $deviceInstallScript.Replace("__DEVICE_PATH__", $DevicePath)
-$deviceInstallScript = $deviceInstallScript.Replace("__CONTINUE_PATH__", $ContinuePath)
-
-$localInstallScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("install-openpilot-branch-" + [guid]::NewGuid().ToString("N") + ".sh")
-
-Write-Step "Installing $InstallerBranch to the connected device"
-try {
-  $deviceInstallScript = $deviceInstallScript.Replace("`r`n", "`n")
-  [System.IO.File]::WriteAllText($localInstallScriptPath, $deviceInstallScript, [System.Text.UTF8Encoding]::new($false))
-  if (Get-Command Get-ForkManagerDeviceBlobFetchScript -ErrorAction SilentlyContinue) {
-    Invoke-Adb -Arguments @("push", (Get-ForkManagerDeviceBlobFetchScript), "/data/fetch_device_blobs.sh") -TimeoutSeconds $AdbPushTimeoutSeconds
-  }
-  Invoke-Adb -Arguments @("push", $localInstallScriptPath, $DeviceScriptPath) -TimeoutSeconds $AdbPushTimeoutSeconds
-  Invoke-Adb -Arguments @("shell", "sh", $DeviceScriptPath) -TimeoutSeconds $AdbInstallTimeoutSeconds
-} finally {
-  Remove-Item -LiteralPath $localInstallScriptPath -Force -ErrorAction SilentlyContinue
-  try {
-    Invoke-Adb -Arguments @("shell", "rm", "-f", $DeviceScriptPath) -TimeoutSeconds $AdbProbeTimeoutSeconds
-  } catch {
-  }
+$isOffroad = (Get-AdbOutput -Arguments @("exec-out", "cat", "/data/params/d/IsOffroad") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
+if ($isOffroad -ne "1") {
+  throw "Turn the vehicle ignition fully off before installing. IsOffroad=$isOffroad."
 }
+$installedAgnosVersion = (Get-AdbOutput -Arguments @("shell", "cat", "/VERSION") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
+$hardware = (Get-AdbOutput -Arguments @("shell", "cat", "/sys/firmware/devicetree/base/model") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim().ToLower()
+$hardware = ($hardware -replace "comma\s+", "").Trim()
+Invoke-ForkManagerCheckCombo -ForkKey "openpilot" -Hardware $hardware -Agnos $installedAgnosVersion
 
+Write-Step "Pushing verified payload and shared install helpers"
+Invoke-Adb -Arguments @("shell", "mkdir", "-p", $DevicePayload) -TimeoutSeconds $AdbProbeTimeoutSeconds
+Invoke-Adb -Arguments @("push", (Get-ForkManagerDeviceHelperPath -Name "device_install_common.sh"), "/data/device_install_common.sh") -TimeoutSeconds $AdbPushTimeoutSeconds
+Invoke-Adb -Arguments @("push", (Get-ForkManagerDeviceHelperPath -Name "device_install_agnos_sync.sh"), "/data/device_install_agnos_sync.sh") -TimeoutSeconds $AdbPushTimeoutSeconds
+Invoke-Adb -Arguments @("push", (Get-ForkManagerDeviceHelperPath -Name "fetch_device_blobs.sh"), "/data/fetch_device_blobs.sh") -TimeoutSeconds $AdbPushTimeoutSeconds
+Invoke-Adb -Arguments @("push", (Join-Path $payloadDir "source.bundle"), "$DevicePayload/source.bundle") -TimeoutSeconds $AdbPushTimeoutSeconds
+Invoke-Adb -Arguments @("push", (Join-Path $payloadDir "artifacts.tar"), "$DevicePayload/artifacts.tar") -TimeoutSeconds $AdbPushTimeoutSeconds
+Invoke-Adb -Arguments @("push", (Join-Path $payloadDir "install_manifest.json"), "$DevicePayload/install_manifest.json") -TimeoutSeconds $AdbPushTimeoutSeconds
+
+$envPrefix = "FORK_KEY=openpilot DEVICE_PATH=$DevicePath BACKUP_PATH=$BackupPath STAGING_PATH=$stagingPath CONTINUE_PATH=$ContinuePath BUNDLE_PATH=$DevicePayload/source.bundle ARTIFACTS_TAR=$DevicePayload/artifacts.tar MANIFEST_PATH=$DevicePayload/install_manifest.json INSTALLER_BRANCH=$InstallerBranch"
+Write-Step "Staging payload without disrupting the live installation"
+Invoke-Adb -Arguments @("shell", "sh", "-c", "$envPrefix sh /data/device_install_common.sh stage") -TimeoutSeconds $AdbInstallTimeoutSeconds
+$isOffroad = (Get-AdbOutput -Arguments @("exec-out", "cat", "/data/params/d/IsOffroad") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
+if ($isOffroad -ne "1") { throw "Vehicle is no longer offroad; activation blocked." }
+
+$installStatus = "staged"
 $safeDirectory = "safe.directory=$DevicePath"
-$deviceCommitBeforeReboot = (Get-AdbOutput -Arguments @("shell", "git", "-c", $safeDirectory, "-C", $DevicePath, "rev-parse", "HEAD") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
-if ($deviceCommitBeforeReboot -ne $headCommit) {
-  throw "Device install did not stage expected commit $headCommit before reboot. Device is still on $deviceCommitBeforeReboot."
-}
-
-  if (-not $SkipReboot) {
-    Write-Step "Restarting software and waiting for it to start"
-    $softwareRestarted = $false
-    try {
-      Start-InstalledSoftware
-      $softwareRestarted = Wait-ForSoftwareReady
-    } catch {
-      Write-Warning "Soft restart failed, falling back to a full reboot."
-    }
-
-    if (-not $softwareRestarted) {
-      Write-Step "Falling back to full device reboot"
-      Request-DeviceReboot
-      Wait-ForDeviceReady
-    }
+try {
+  Write-Step "Activating staged installation"
+  Invoke-Adb -Arguments @("shell", "sh", "-c", "$envPrefix sh /data/device_install_common.sh activate") -TimeoutSeconds $AdbInstallTimeoutSeconds
+  $installStatus = "activated"
+  $got = (Get-AdbOutput -Arguments @("shell", "git", "-c", $safeDirectory, "-C", $DevicePath, "rev-parse", "HEAD") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
+  if ($got -ne $headCommit) { throw "Device commit $got != $headCommit" }
+  if ($SkipReboot) {
+    Write-Host "Status: staged; runtime unverified (SkipReboot)."
+    $installStatus = "staged; runtime unverified"
   } else {
-    Write-Step "Skipping reboot"
+    if (Get-Command Start-InstalledSoftware -ErrorAction SilentlyContinue) { Start-InstalledSoftware }
+    if (-not (Wait-ForSoftwareReady)) {
+      throw "openpilot failed sustained offroad health."
+    }
+    $installStatus = "healthy"
   }
-
+} catch {
+  Write-Warning "Activation/health failed; rolling back. $($_.Exception.Message)"
+  try {
+    Invoke-Adb -Arguments @("shell", "sh", "-c", "$envPrefix sh /data/device_install_common.sh rollback") -TimeoutSeconds $AdbInstallTimeoutSeconds
+    $installStatus = "rolled back"
+  } catch { $installStatus = "recovery required" }
+  throw "Install did not complete ($installStatus). $($_.Exception.Message)"
+}
 Write-Step "Verifying deployed branch"
 $deviceBranch = (Get-AdbOutput -Arguments @("shell", "git", "-c", $safeDirectory, "-C", $DevicePath, "branch", "--show-current") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
 $deviceCommit = (Get-AdbOutput -Arguments @("shell", "git", "-c", $safeDirectory, "-C", $DevicePath, "rev-parse", "--short", "HEAD") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
