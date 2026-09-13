@@ -88,3 +88,13 @@ build/
 .context/
 PLAN.md
 TASK.md
+
+# BEGIN FORK-MANAGER-RUNTIME-BLOBS
+# Keep comma runtime blobs trackable. Upstream gitignores *.pkl / *.so, which
+# hides proprietary binary artifacts (models and native prebuilts) from git add.
+# Fork Manager un-ignores those paths and fetches them during install.
+!**/selfdrive/modeld/models/*.pkl
+!**/selfdrive/modeld/models/*.pkl*
+!**/selfdrive/modeld/models/*.onnx
+!**/selfdrive/modeld/firmware/**
+# END FORK-MANAGER-RUNTIME-BLOBS
