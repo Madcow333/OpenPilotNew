@@ -568,12 +568,18 @@ try {
     $installStatus = "healthy"
   }
 } catch {
-  Write-Warning "Activation/health failed; rolling back. $($_.Exception.Message)"
+  $activationError = $_.Exception.Message
+  Write-Warning "Activation/health failed; rolling back. $activationError"
   try {
     Invoke-Adb -Arguments ($deviceInstallCommand + @("rollback")) -TimeoutSeconds $AdbInstallTimeoutSeconds
-    $installStatus = "rolled back"
+    if (-not $SkipReboot) {
+      Start-InstalledSoftware
+      $installStatus = "rolled back and restarted"
+    } else {
+      $installStatus = "rolled back"
+    }
   } catch { $installStatus = "recovery required" }
-  throw "Install did not complete ($installStatus). $($_.Exception.Message)"
+  throw "Install did not complete ($installStatus). $activationError"
 }
 Write-Step "Verifying deployed branch"
 $deviceBranch = (Get-AdbOutput -Arguments @("shell", "git", "-c", $safeDirectory, "-C", $DevicePath, "branch", "--show-current") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
