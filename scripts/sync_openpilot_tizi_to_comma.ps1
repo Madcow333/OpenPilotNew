@@ -238,7 +238,7 @@ try {
   $isOffroad = (Get-AdbOutput -Arguments @("exec-out", "cat", "/data/params/d/IsOffroad") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
   if ($isOffroad -ne "1") { throw "Turn the vehicle ignition fully off before installing. IsOffroad=$isOffroad." }
   $installedAgnosVersion = (Get-AdbOutput -Arguments @("shell", "cat", "/VERSION") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
-  $hardware = (Get-AdbOutput -Arguments @("shell", "cat", "/sys/firmware/devicetree/base/model") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim().ToLower()
+  $hardware = (Get-AdbOutput -Arguments @("shell", "cat", "/sys/firmware/devicetree/base/model") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim().Trim([char]0).Trim().ToLower()
   $hardware = ($hardware -replace "comma\s+", "").Trim()
   Invoke-ForkManagerCheckCombo -ForkKey "openpilot" -Hardware $hardware -Agnos $installedAgnosVersion
 
