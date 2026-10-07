@@ -251,9 +251,19 @@ try {
   Invoke-Adb -Arguments @("push", (Join-Path $payloadDir "artifacts.tar"), "$DevicePayload/artifacts.tar") -TimeoutSeconds $AdbPushTimeoutSeconds
   Invoke-Adb -Arguments @("push", (Join-Path $payloadDir "install_manifest.json"), "$DevicePayload/install_manifest.json") -TimeoutSeconds $AdbPushTimeoutSeconds
 
-  $envPrefix = "FORK_KEY=openpilot DEVICE_PATH=$DevicePath BACKUP_PATH=$BackupPath STAGING_PATH=$stagingPath CONTINUE_PATH=$ContinuePath BUNDLE_PATH=$DevicePayload/source.bundle ARTIFACTS_TAR=$DevicePayload/artifacts.tar MANIFEST_PATH=$DevicePayload/install_manifest.json INSTALLER_BRANCH=$InstallerBranch"
+  $deviceInstallCommand = @("shell", "env") + @(
+    "FORK_KEY=openpilot",
+    "DEVICE_PATH=$DevicePath",
+    "BACKUP_PATH=$BackupPath",
+    "STAGING_PATH=$stagingPath",
+    "CONTINUE_PATH=$ContinuePath",
+    "BUNDLE_PATH=$DevicePayload/source.bundle",
+    "ARTIFACTS_TAR=$DevicePayload/artifacts.tar",
+    "MANIFEST_PATH=$DevicePayload/install_manifest.json",
+    "INSTALLER_BRANCH=$InstallerBranch"
+  ) + @("sh", "/data/device_install_common.sh")
   Write-Step "Staging payload without disrupting the live installation"
-  Invoke-Adb -Arguments @("shell", "sh", "-c", "$envPrefix sh /data/device_install_common.sh stage") -TimeoutSeconds $AdbInstallTimeoutSeconds
+  Invoke-Adb -Arguments ($deviceInstallCommand + @("stage")) -TimeoutSeconds $AdbInstallTimeoutSeconds
   $isOffroad = (Get-AdbOutput -Arguments @("exec-out", "cat", "/data/params/d/IsOffroad") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
   if ($isOffroad -ne "1") { throw "Vehicle is no longer offroad; activation blocked." }
 
@@ -261,7 +271,7 @@ try {
   $safeDirectory = "safe.directory=$DevicePath"
   try {
     Write-Step "Activating staged installation"
-    Invoke-Adb -Arguments @("shell", "sh", "-c", "$envPrefix sh /data/device_install_common.sh activate") -TimeoutSeconds $AdbInstallTimeoutSeconds
+    Invoke-Adb -Arguments ($deviceInstallCommand + @("activate")) -TimeoutSeconds $AdbInstallTimeoutSeconds
     $installStatus = "activated"
     $got = (Get-AdbOutput -Arguments @("shell", "git", "-c", $safeDirectory, "-C", $DevicePath, "rev-parse", "HEAD") -TimeoutSeconds $AdbProbeTimeoutSeconds).Trim()
     if ($got -ne $headCommit) { throw "Device commit $got != $headCommit" }
@@ -277,7 +287,7 @@ try {
   } catch {
     Write-Warning "Activation/health failed; rolling back. $($_.Exception.Message)"
     try {
-      Invoke-Adb -Arguments @("shell", "sh", "-c", "$envPrefix sh /data/device_install_common.sh rollback") -TimeoutSeconds $AdbInstallTimeoutSeconds
+      Invoke-Adb -Arguments ($deviceInstallCommand + @("rollback")) -TimeoutSeconds $AdbInstallTimeoutSeconds
       $installStatus = "rolled back"
     } catch { $installStatus = "recovery required" }
     throw "Install did not complete ($installStatus). $($_.Exception.Message)"
